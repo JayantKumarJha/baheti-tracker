@@ -1,6 +1,9 @@
 /* =====================================================================
    BAHETI - Aluminium Material Sorting Tracker
    Front-end logic. Data is stored in Supabase (see supabase/schema.sql).
+
+   Productivity = Total Quantity / (No. of Workers x Total Sorting Hrs)
+   Unit: Kg per Worker-Hour
    ===================================================================== */
 
 // ---------------------------------------------------------------------
@@ -11,6 +14,8 @@ const IS_CONFIGURED =
     !!CFG.SUPABASE_URL && !!CFG.SUPABASE_ANON_KEY &&
     !CFG.SUPABASE_URL.includes('YOUR-PROJECT-ID') &&
     !CFG.SUPABASE_ANON_KEY.startsWith('YOUR-');
+
+const PROD_UNIT = 'Kg/Worker-Hr';
 
 let sb = null;                 // Supabase client
 let appUserId = null;          // id of the logged-in user (null = logged out)
@@ -54,6 +59,17 @@ function esc(value) {
 }
 
 function pad2(n) { return String(n).padStart(2, '0'); }
+
+// Productivity = quantity / (workers * sorting hours)
+function calcProductivity(qty, workers, hours) {
+    const manHours = workers * hours;
+    return manHours > 0 ? qty / manHours : 0;
+}
+
+// Total worker-hours (workers * hours) across a list of logs
+function manHoursOf(logs) {
+    return logs.reduce((a, l) => a + l.workers * l.workHours, 0);
+}
 
 // ISO timestamp from the database -> "YYYY-MM-DDTHH:mm" in the user's local time
 function toLocalInput(iso) {
@@ -122,6 +138,13 @@ async function init() {
     setCurrentDateTime();
     startLiveClock();
     document.getElementById('monthlyFilterPicker').value = `${currentYear}-${currentMonthStr}`;
+
+    // Keep the live productivity box in sync with all three inputs it depends on
+    ['workers', 'workHours', 'sortedQty'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('input', calculateLiveProductivity);
+    });
+    calculateLiveProductivity();
 
     // Modal keyboard shortcuts
     document.getElementById('customOptionInput').addEventListener('keydown', (e) => {
@@ -428,12 +451,14 @@ async function saveCustomOption() {
 // ---------------------------------------------------------------------
 // 7. The entry form
 // ---------------------------------------------------------------------
+// Productivity = sortedQty / (workers * workHours)
 function calculateLiveProductivity() {
+    const workers = parseFloat(document.getElementById('workers').value) || 0;
     const workHours = parseFloat(document.getElementById('workHours').value) || 0;
     const sortedQty = parseFloat(document.getElementById('sortedQty').value) || 0;
-    const productivity = workHours > 0 ? sortedQty / workHours : 0;
+    const productivity = calcProductivity(sortedQty, workers, workHours);
     document.getElementById('liveProductivity').innerHTML =
-        `${productivity.toFixed(2)} <span class="text-[10px] font-normal text-slate-500">Kg/Hr</span>`;
+        `${productivity.toFixed(2)} <span class="text-[10px] font-normal text-slate-500">${PROD_UNIT}</span>`;
 }
 
 async function handleFormSubmit(e) {
@@ -537,7 +562,8 @@ function renderTable() {
     document.getElementById('emptyState').classList.toggle('hidden', filteredLogs.length !== 0);
 
     filteredLogs.forEach(log => {
-        const productivity = log.workHours > 0 ? (log.sortedQty / log.workHours).toFixed(2) : '0.00';
+        // Productivity = qty / (workers * sorting hours)
+        const productivity = calcProductivity(log.sortedQty, log.workers, log.workHours).toFixed(2);
         const formattedDate = new Date(log.dateTime).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' });
 
         const tr = document.createElement('tr');
@@ -556,7 +582,7 @@ function renderTable() {
                     ${esc(log.issuedOn)}
                 </span>
             </td>
-            <td class="py-2.5 px-3 text-right font-bold text-sky-700">${productivity} <span class="text-[10px] text-slate-400 font-normal">Kg/Hr</span></td>
+            <td class="py-2.5 px-3 text-right font-bold text-sky-700">${productivity} <span class="text-[10px] text-slate-400 font-normal">${PROD_UNIT}</span></td>
             <td class="py-2.5 px-3 text-center">
                 <button onclick="deleteEntry('${esc(log.id)}')" class="text-rose-500 hover:text-rose-700 p-1 rounded transition" title="Delete entry" aria-label="Delete entry">
                     <i class="fa-solid fa-trash-can text-xs"></i>
@@ -574,14 +600,15 @@ function applyFilters() {
 function updateGlobalKPIs() {
     const totalEntries = sortingLogs.length;
     const totalWeight = sortingLogs.reduce((acc, log) => acc + log.sortedQty, 0);
-    const totalWorkHours = sortingLogs.reduce((acc, log) => acc + log.workHours, 0);
-    const avgProductivity = totalWorkHours > 0 ? (totalWeight / totalWorkHours) : 0;
+    const totalManHours = manHoursOf(sortingLogs);
+    // Average productivity = total qty / total (workers * hours)
+    const avgProductivity = totalManHours > 0 ? (totalWeight / totalManHours) : 0;
     const uniqueHeats = new Set(sortingLogs.map(l => l.heatNo).filter(Boolean)).size;
 
     document.getElementById('kpiTotalWeight').innerHTML = `${totalWeight.toLocaleString()} <span class="text-xs font-normal text-slate-500">Kg</span>`;
     document.getElementById('kpiTotalHeats').textContent = uniqueHeats;
     document.getElementById('kpiTotalEntries').textContent = totalEntries;
-    document.getElementById('kpiAvgProductivity').innerHTML = `${avgProductivity.toFixed(2)} <span class="text-xs font-normal text-slate-500">Kg/Hr</span>`;
+    document.getElementById('kpiAvgProductivity').innerHTML = `${avgProductivity.toFixed(2)} <span class="text-xs font-normal text-slate-500">${PROD_UNIT}</span>`;
 }
 
 // ---------------------------------------------------------------------
@@ -636,13 +663,15 @@ function renderMonthlyAnalytics() {
     const monthTotalQty = monthLogs.reduce((a, b) => a + b.sortedQty, 0);
     const monthTotalWorkers = monthLogs.reduce((a, b) => a + b.workers, 0);
     const monthTotalHours = monthLogs.reduce((a, b) => a + b.workHours, 0);
-    const monthAvgProd = monthTotalHours > 0 ? (monthTotalQty / monthTotalHours) : 0;
+    const monthManHours = manHoursOf(monthLogs);
+    // Monthly productivity = total qty / total (workers * hours)
+    const monthAvgProd = monthManHours > 0 ? (monthTotalQty / monthManHours) : 0;
 
     document.getElementById('monthTotalQty').textContent = `${monthTotalQty.toLocaleString()} Kg`;
     document.getElementById('monthTotalQtyMT').textContent = `${(monthTotalQty / 1000).toFixed(2)} MT`;
     document.getElementById('monthTotalWorkers').textContent = `${monthTotalWorkers} Workers`;
     document.getElementById('monthTotalHours').textContent = `${monthTotalHours.toFixed(1)} Hours`;
-    document.getElementById('monthAvgProductivity').textContent = `${monthAvgProd.toFixed(2)} Kg/Hr`;
+    document.getElementById('monthAvgProductivity').textContent = `${monthAvgProd.toFixed(2)} ${PROD_UNIT}`;
 
     renderDailyBreakdownTable(selYear, selMonth, monthLogs);
     renderContractorSummaryTable(monthLogs);
@@ -661,7 +690,8 @@ function renderDailyBreakdownTable(year, month, monthLogs) {
         const dayQty = dayLogs.reduce((a, b) => a + b.sortedQty, 0);
         const dayWorkers = dayLogs.reduce((a, b) => a + b.workers, 0);
         const dayHours = dayLogs.reduce((a, b) => a + b.workHours, 0);
-        const dayProd = dayHours > 0 ? (dayQty / dayHours).toFixed(2) : '0.00';
+        const dayManHours = manHoursOf(dayLogs);
+        const dayProd = dayManHours > 0 ? (dayQty / dayManHours).toFixed(2) : '0.00';
 
         const dateObj = new Date(year, month - 1, day);
         const dateLabel = dateObj.toLocaleDateString([], { day: '2-digit', month: 'short' });
@@ -693,6 +723,7 @@ function renderContractorSummaryTable(monthLogs) {
                 sortedQty: 0,
                 workers: 0,
                 workHours: 0,
+                manHours: 0,
                 materials: {}
             };
         }
@@ -702,6 +733,7 @@ function renderContractorSummaryTable(monthLogs) {
         c.sortedQty += log.sortedQty;
         c.workers += log.workers;
         c.workHours += log.workHours;
+        c.manHours += log.workers * log.workHours;
         c.materials[log.materialType] = (c.materials[log.materialType] || 0) + log.sortedQty;
     });
 
@@ -713,7 +745,8 @@ function renderContractorSummaryTable(monthLogs) {
     }
 
     contractorList.forEach(c => {
-        const prod = c.workHours > 0 ? (c.sortedQty / c.workHours).toFixed(2) : '0.00';
+        // Productivity = total qty / total (workers * hours)
+        const prod = c.manHours > 0 ? (c.sortedQty / c.manHours).toFixed(2) : '0.00';
 
         let topMat = '-';
         let maxQty = 0;
@@ -765,11 +798,11 @@ function renderContractorMatrix(year, month, monthLogs) {
             const dayLogs = monthLogs.filter(l => l.contractorName === con && new Date(l.dateTime).getDate() === d);
 
             const dayQty = dayLogs.reduce((a, b) => a + b.sortedQty, 0);
-            const dayHours = dayLogs.reduce((a, b) => a + b.workHours, 0);
-            const prod = dayHours > 0 ? Math.round(dayQty / dayHours) : 0;
+            const dayManHours = manHoursOf(dayLogs);
+            const prod = dayManHours > 0 ? Math.round(dayQty / dayManHours) : 0;
 
             if (prod > 0) {
-                rowHtml += `<td class="py-2 px-1 text-center font-mono font-bold bg-sky-50 text-sky-700 border text-[10px]" title="Qty: ${dayQty}kg, Hrs: ${dayHours}">${prod}</td>`;
+                rowHtml += `<td class="py-2 px-1 text-center font-mono font-bold bg-sky-50 text-sky-700 border text-[10px]" title="Qty: ${dayQty}kg, Worker-Hrs: ${dayManHours}">${prod}</td>`;
             } else {
                 rowHtml += `<td class="py-2 px-1 text-center font-mono text-slate-200 border text-[10px]">-</td>`;
             }
@@ -796,7 +829,7 @@ function exportToCSV() {
         return;
     }
 
-    const headers = ['Heat No.', 'Date & Time', 'Material Type', 'Vendor Name', 'Contractor Name', 'Workers', 'Total Work Hours', 'Sorted Qty (Kg)', 'Issued On', 'Productivity (Kg/Hr)'];
+    const headers = ['Heat No.', 'Date & Time', 'Material Type', 'Vendor Name', 'Contractor Name', 'Workers', 'Total Work Hours', 'Sorted Qty (Kg)', 'Issued On', `Productivity (${PROD_UNIT})`];
     const rows = sortingLogs.map(log => [
         csvText(log.heatNo),
         csvText(log.dateTime.replace('T', ' ')),
@@ -807,7 +840,7 @@ function exportToCSV() {
         log.workHours,
         log.sortedQty,
         csvText(log.issuedOn),
-        log.workHours > 0 ? (log.sortedQty / log.workHours).toFixed(2) : 0
+        calcProductivity(log.sortedQty, log.workers, log.workHours).toFixed(2)
     ]);
 
     // "\ufeff" (BOM) makes Excel open the file with correct characters
